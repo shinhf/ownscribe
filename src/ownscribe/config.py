@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -10,10 +11,15 @@ from pathlib import Path
 CONFIG_DIR = Path("~/.config/ownscribe").expanduser()
 CONFIG_PATH = CONFIG_DIR / "config.toml"
 
+# Backends that capture system audio; other platforms fall back to sounddevice (input devices only).
+_PLATFORM_AUDIO_BACKENDS = {"darwin": "coreaudio", "win32": "wasapi"}
+
 DEFAULT_CONFIG_TOML = """\
 [audio]
-backend = "coreaudio"     # "coreaudio" (default) or "sounddevice"
-device = ""               # empty = system audio; or device name/index for sounddevice
+backend = "auto"          # "auto" (coreaudio on macOS, wasapi on Windows, else sounddevice),
+                          # "coreaudio", "wasapi", or "sounddevice"
+device = ""               # empty = system audio; wasapi: speaker name/index to loop back;
+                          # sounddevice: input device name/index
 mic = true                # also capture microphone input
 mic_device = ""           # specific mic device name (empty = default)
 capture_mode = "all"      # "all" = capture all system audio directly; "picker" = show source picker
@@ -23,6 +29,8 @@ silence_timeout = 300     # seconds of silence before auto-stop; 0 = disabled
 model = "base"            # whisper model: tiny, base, small, medium, large-v3
 language = ""             # empty = auto-detect
 threads = 0               # CPU threads for transcription; 0 = auto-detect from core count
+device = "auto"           # "auto" (cuda > mps > cpu), "cuda", "mps", or "cpu"; Whisper runs on cpu for mps
+compute_type = "auto"     # "auto" (float16 on cuda, int8 otherwise) or any CTranslate2 type
 # initial_prompt = ""     # prime Whisper with context: domain vocab, speaker names, expected phrases
 # hotwords = ""           # comma-separated words to boost recognition (softer hint than initial_prompt)
 
@@ -32,7 +40,7 @@ hf_token = ""             # HuggingFace token for pyannote models
 min_speakers = 0          # 0 = auto-detect
 max_speakers = 0
 telemetry = false         # set to true to allow HuggingFace Hub + pyannote metrics telemetry
-device = "auto"           # "auto" (mps if available), "mps", or "cpu"
+device = "auto"           # "auto" (cuda > mps > cpu), "cuda", "mps", or "cpu"
 
 [summarization]
 enabled = true
@@ -59,12 +67,19 @@ keep_recording = true     # keep WAV files after transcription; false = auto-del
 
 @dataclass
 class AudioConfig:
-    backend: str = "coreaudio"
+    backend: str = "auto"  # "auto", "coreaudio", "wasapi", or "sounddevice"
     device: str = ""
     mic: bool = True
     mic_device: str = ""
     capture_mode: str = "all"  # "all" = all system audio; "picker" = show source picker
     silence_timeout: int = 300  # seconds of silence before auto-stop; 0 = disabled
+
+    @property
+    def resolved_backend(self) -> str:
+        """The concrete backend: "auto" picks the system-audio backend for this platform."""
+        if self.backend != "auto":
+            return self.backend
+        return _PLATFORM_AUDIO_BACKENDS.get(sys.platform, "sounddevice")
 
 
 @dataclass
@@ -74,6 +89,8 @@ class TranscriptionConfig:
     initial_prompt: str = ""
     hotwords: str = ""
     threads: int = 0  # CPU threads for transcription; 0 = auto-detect from core count
+    device: str = "auto"  # "auto" (cuda > mps > cpu), "cuda", "mps", or "cpu"
+    compute_type: str = "auto"  # "auto" = float16 on cuda, int8 otherwise
 
 
 @dataclass

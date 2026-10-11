@@ -8,6 +8,18 @@ from unittest import mock
 import pytest
 
 
+def _fake_torch(*, cuda: bool, mps: bool) -> types.SimpleNamespace:
+    return types.SimpleNamespace(
+        cuda=types.SimpleNamespace(is_available=lambda: cuda),
+        backends=types.SimpleNamespace(mps=types.SimpleNamespace(is_available=lambda: mps)),
+    )
+
+
+# Tests that swap sys.modules must not import the real torch inside the patch: patch.dict
+# would evict it on exit and torch cannot be imported a second time in one process.
+_CPU_TORCH = _fake_torch(cuda=False, mps=False)
+
+
 class TestFfmpegCheck:
     def test_missing_ffmpeg_exits(self):
         from ownscribe.config import TranscriptionConfig
@@ -28,7 +40,7 @@ class TestThreads:
 
         fake_whisperx = mock.MagicMock()
         transcriber = WhisperXTranscriber(config, None)
-        with mock.patch.dict("sys.modules", {"whisperx": fake_whisperx}):
+        with mock.patch.dict("sys.modules", {"whisperx": fake_whisperx, "torch": _CPU_TORCH}):
             transcriber._load_model()
         return fake_whisperx.load_model.call_args.kwargs
 
@@ -262,7 +274,7 @@ class TestAlignmentIsSkippedWhenUnused:
         transcriber._model.transcribe.side_effect = _transcribe
 
         with (
-            mock.patch.dict("sys.modules", {"whisperx": fake_whisperx}),
+            mock.patch.dict("sys.modules", {"whisperx": fake_whisperx, "torch": _CPU_TORCH}),
             mock.patch.object(transcriber, "_prepare_transcription_models"),
             mock.patch.object(transcriber, "_load_align_model", return_value=(object(), object())),
             mock.patch.object(transcriber, "_diarize", side_effect=lambda _audio, res: res),
@@ -363,6 +375,8 @@ class TestDiarizationApiCompat:
         fake_whisperx = types.SimpleNamespace(assign_word_speakers=lambda df, res: ("assigned", df, res))
 
         audio = np.zeros(16000, dtype=np.float32)
+        # _diarize needs the real torch; import it before patch.dict so the restore does not evict it.
+        import torch  # noqa: F401
 
         with (
             mock.patch.object(transcriber, "_load_diarization_pipeline", return_value=fake_diarize_model),
@@ -372,3 +386,85 @@ class TestDiarizationApiCompat:
 
         fake_annotation.itertracks.assert_called_once_with(yield_label=True)
         assert out[0] == "assigned"
+
+
+class TestResolveTorchDevice:
+    @pytest.mark.parametrize(
+        ("cuda", "mps", "expected"),
+        [(True, True, "cuda"), (True, False, "cuda"), (False, True, "mps"), (False, False, "cpu")],
+    )
+    def test_auto_prefers_cuda_then_mps(self, cuda, mps, expected):
+        from ownscribe.transcription.whisperx_transcriber import resolve_torch_device
+
+        with mock.patch.dict("sys.modules", {"torch": _fake_torch(cuda=cuda, mps=mps)}):
+            assert resolve_torch_device("auto") == expected
+
+    @pytest.mark.parametrize("device", ["cpu", "cuda", "mps", "cuda:1"])
+    def test_explicit_device_passes_through_without_torch(self, device):
+        from ownscribe.transcription.whisperx_transcriber import resolve_torch_device
+
+        with mock.patch.dict("sys.modules", {"torch": None}):
+            assert resolve_torch_device(device) == device
+
+    def test_diarization_pipeline_uses_resolved_device(self):
+        from ownscribe.config import DiarizationConfig, TranscriptionConfig
+        from ownscribe.transcription.whisperx_transcriber import WhisperXTranscriber
+
+        diar = DiarizationConfig(enabled=True, hf_token="hf_test", device="auto")
+        transcriber = WhisperXTranscriber(TranscriptionConfig(), diar)
+        pipeline_cls = mock.MagicMock()
+        fake_diarize = types.SimpleNamespace(DiarizationPipeline=pipeline_cls)
+
+        with mock.patch.dict(
+            "sys.modules",
+            {"whisperx.diarize": fake_diarize, "torch": _fake_torch(cuda=True, mps=False)},
+        ):
+            transcriber._load_diarization_pipeline()
+
+        assert pipeline_cls.call_args.kwargs["device"] == "cuda"
+
+
+class TestWhisperDevice:
+    @staticmethod
+    def _load_model_args(config, *, cuda: bool, mps: bool = False):
+        from ownscribe.transcription.whisperx_transcriber import WhisperXTranscriber
+
+        fake_whisperx = mock.MagicMock()
+        transcriber = WhisperXTranscriber(config, None)
+        with mock.patch.dict("sys.modules", {"whisperx": fake_whisperx, "torch": _fake_torch(cuda=cuda, mps=mps)}):
+            transcriber._load_model()
+        call = fake_whisperx.load_model.call_args
+        return call.args[1], call.kwargs["compute_type"]
+
+    def test_cuda_uses_float16(self):
+        from ownscribe.config import TranscriptionConfig
+
+        assert self._load_model_args(TranscriptionConfig(), cuda=True) == ("cuda", "float16")
+
+    def test_cpu_uses_int8(self):
+        from ownscribe.config import TranscriptionConfig
+
+        assert self._load_model_args(TranscriptionConfig(), cuda=False) == ("cpu", "int8")
+
+    def test_mps_runs_whisper_on_cpu(self):
+        from ownscribe.config import TranscriptionConfig
+
+        assert self._load_model_args(TranscriptionConfig(), cuda=False, mps=True) == ("cpu", "int8")
+
+    def test_explicit_compute_type_wins(self):
+        from ownscribe.config import TranscriptionConfig
+
+        config = TranscriptionConfig(device="cuda", compute_type="int8_float16")
+        assert self._load_model_args(config, cuda=False) == ("cuda", "int8_float16")
+
+    def test_alignment_model_follows_whisper_device(self):
+        from ownscribe.config import TranscriptionConfig
+        from ownscribe.transcription.whisperx_transcriber import WhisperXTranscriber
+
+        fake_whisperx = mock.MagicMock()
+        fake_whisperx.load_align_model.return_value = (object(), object())
+        transcriber = WhisperXTranscriber(TranscriptionConfig(), None)
+        with mock.patch.dict("sys.modules", {"whisperx": fake_whisperx, "torch": _fake_torch(cuda=True, mps=False)}):
+            transcriber._load_align_model("en")
+
+        assert fake_whisperx.load_align_model.call_args.kwargs["device"] == "cuda"

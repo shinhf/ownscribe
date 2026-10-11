@@ -5,7 +5,12 @@ from __future__ import annotations
 import signal
 from unittest import mock
 
+import pytest
+
 from ownscribe.audio.base import AudioRecorder
+
+# The Core Audio helper is toggled with SIGUSR1, which Windows does not define.
+_needs_sigusr1 = pytest.mark.skipif(not hasattr(signal, "SIGUSR1"), reason="SIGUSR1 is POSIX-only")
 
 
 class TestBaseClassMuteDefaults:
@@ -47,6 +52,7 @@ class TestBaseClassMuteDefaults:
 
         recorder = DummyRecorder()
         assert recorder.is_muted is False
+        assert recorder.supports_mute is False
 
 
 class TestCoreAudioRecorderMute:
@@ -58,6 +64,7 @@ class TestCoreAudioRecorderMute:
         with mock.patch("ownscribe.audio.coreaudio._find_binary", return_value=None):
             return CoreAudioRecorder(mic=mic)
 
+    @_needs_sigusr1
     def test_toggle_mute_sends_sigusr1(self):
         recorder = self._make_recorder(mic=True)
         proc = mock.MagicMock()
@@ -69,6 +76,7 @@ class TestCoreAudioRecorderMute:
         proc.send_signal.assert_called_once_with(signal.SIGUSR1)
         assert recorder.is_muted is True
 
+    @_needs_sigusr1
     def test_toggle_mute_twice_unmutes(self):
         recorder = self._make_recorder(mic=True)
         proc = mock.MagicMock()
@@ -114,3 +122,7 @@ class TestCoreAudioRecorderMute:
     def test_is_muted_default_false(self):
         recorder = self._make_recorder(mic=True)
         assert recorder.is_muted is False
+
+    def test_supports_mute_follows_mic(self):
+        assert self._make_recorder(mic=True).supports_mute is True
+        assert self._make_recorder(mic=False).supports_mute is False

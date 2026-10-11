@@ -88,6 +88,89 @@ class TestCreateRecorder:
             _create_recorder(config)
             mock_sd.assert_called_once_with(device="USB Mic", silence_timeout=60)
 
+    def test_auto_backend_picks_wasapi_on_windows(self):
+        from ownscribe.pipeline import _create_recorder
+
+        config = Config()
+        config.audio.device = "Headphones"
+        config.audio.mic_device = "USB Mic"
+        config.audio.silence_timeout = 90
+
+        with (
+            mock.patch("ownscribe.config.sys.platform", "win32"),
+            mock.patch("ownscribe.audio.wasapi_recorder.WasapiLoopbackRecorder") as mock_cls,
+        ):
+            mock_cls.return_value.is_available.return_value = True
+            recorder = _create_recorder(config)
+
+        assert recorder == mock_cls.return_value
+        mock_cls.assert_called_once_with(mic=True, mic_device="USB Mic", device="Headphones", silence_timeout=90)
+
+    def test_wasapi_falls_back_to_sounddevice_when_unavailable(self, capsys):
+        from ownscribe.pipeline import _create_recorder
+
+        config = Config()
+        config.audio.backend = "wasapi"
+
+        with (
+            mock.patch("ownscribe.audio.wasapi_recorder.WasapiLoopbackRecorder") as mock_wasapi,
+            mock.patch("ownscribe.audio.sounddevice_recorder.SoundDeviceRecorder") as mock_sd,
+        ):
+            mock_wasapi.return_value.is_available.return_value = False
+            recorder = _create_recorder(config)
+
+        assert recorder == mock_sd.return_value
+        assert "falling back to sounddevice" in capsys.readouterr().out
+
+
+class TestRecordingLoopKeys:
+    """run_pipeline reads keys through key_reader only when mute is possible and stdin is a TTY."""
+
+    @staticmethod
+    def _recorder(supports_mute: bool) -> mock.MagicMock:
+        recorder = mock.MagicMock()
+        recorder.supports_mute = supports_mute
+        recorder.is_muted = False
+        recorder.silence_timed_out = False
+        recorder.silence_warning = False
+        # One loop iteration, then stop.
+        type(recorder).is_recording = mock.PropertyMock(side_effect=[True, False])
+        recorder.start.side_effect = lambda path: path.write_bytes(b"x" * 100)
+        return recorder
+
+    def _run(self, tmp_path, recorder, keys):
+        from ownscribe.pipeline import run_pipeline
+
+        config = Config()
+        config.output.dir = str(tmp_path)
+
+        @contextlib.contextmanager
+        def fake_key_reader():
+            yield lambda _timeout: next(keys, None)
+
+        with (
+            mock.patch("ownscribe.pipeline._create_recorder", return_value=recorder),
+            mock.patch("ownscribe.pipeline._do_transcribe_and_summarize"),
+            mock.patch("ownscribe.pipeline._check_audio_silence"),
+            mock.patch("ownscribe.pipeline.key_reader", side_effect=fake_key_reader) as mock_reader,
+            mock.patch("ownscribe.pipeline.sys.stdin") as stdin,
+        ):
+            stdin.isatty.return_value = True
+            run_pipeline(config)
+        return mock_reader
+
+    def test_m_toggles_mute(self, tmp_path):
+        recorder = self._recorder(supports_mute=True)
+        self._run(tmp_path, recorder, iter(["m"]))
+        recorder.toggle_mute.assert_called_once()
+
+    def test_no_key_reader_without_mute_support(self, tmp_path):
+        recorder = self._recorder(supports_mute=False)
+        with mock.patch("ownscribe.pipeline.time.sleep"):
+            mock_reader = self._run(tmp_path, recorder, iter(["m"]))
+        mock_reader.assert_not_called()
+        recorder.toggle_mute.assert_not_called()
+
 
 class TestUnsupportedAudioSettings:
     """Flags the sounddevice backend cannot honour must warn, not be ignored."""
@@ -746,6 +829,7 @@ class TestRunPipelineAudioLocation:
         recorder = mock.MagicMock()
         recorder.is_recording = False  # skip the recording loop immediately
         recorder.is_muted = False
+        recorder.supports_mute = False
         recorder.silence_timed_out = False
         recorder.silence_warning = False
 
@@ -1126,3 +1210,33 @@ class TestResume:
         with mock.patch("ownscribe.pipeline.run_summarize") as mock_sum:
             run_resume(config, str(tmp_path))
             mock_sum.assert_called_once_with(config, str(tmp_path / "transcript.json"))
+
+
+class TestCheckAudioSilence:
+    def _write(self, path, samples):
+        import numpy as np
+        import soundfile as sf
+
+        sf.write(path, np.asarray(samples, dtype="float32"), 16000, subtype="FLOAT")
+
+    def test_late_audio_is_not_silent(self, tmp_path):
+        """A recording that starts quiet (zero-padded loopback) must pass."""
+        import numpy as np
+
+        from ownscribe.pipeline import _check_audio_silence
+
+        wav = tmp_path / "late.wav"
+        self._write(wav, np.concatenate([np.zeros(16000 * 12), np.full(1600, 0.2)]))
+        _check_audio_silence(wav)  # no SystemExit
+
+    def test_all_zero_exits(self, tmp_path, capsys):
+        import numpy as np
+        import pytest
+
+        from ownscribe.pipeline import _check_audio_silence
+
+        wav = tmp_path / "silent.wav"
+        self._write(wav, np.zeros(16000 * 3))
+        with pytest.raises(SystemExit):
+            _check_audio_silence(wav)
+        assert "completely silent" in capsys.readouterr().err

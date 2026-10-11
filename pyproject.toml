@@ -15,6 +15,7 @@ classifiers = [
     "Intended Audience :: End Users/Desktop",
     "License :: OSI Approved :: MIT License",
     "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Topic :: Multimedia :: Sound/Audio :: Speech",
@@ -29,6 +30,14 @@ dependencies = [
     # calls; drop this cap and the <3.14 python cap once fixed upstream
     # (pyannote/pyannote-audio#1974).
     "torchaudio>=2.8,<2.9",
+    # torch and torchvision only come in transitively (whisperx, pyannote), but
+    # uv applies [tool.uv.sources] to direct dependencies only, so they are
+    # listed here to route them to the CUDA index on Windows. Pinned to the
+    # releases that pair with torchaudio 2.8.
+    "torch>=2.8,<2.9",
+    "torchvision>=0.23,<0.24",
+    # WASAPI loopback capture of the speakers on Windows.
+    "PyAudioWPatch>=0.2.12 ; sys_platform == 'win32'",
     "llama-cpp-python>=0.3",
     "huggingface-hub>=0.20",
 ]
@@ -55,6 +64,24 @@ dev = [
     "ruff>=0.9",
 ]
 
+# Blackwell GPUs (sm_120) need CUDA >= 12.8; torch 2.8 publishes cu128 wheels.
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu128", marker = "sys_platform == 'win32'" }]
+torchaudio = [{ index = "pytorch-cu128", marker = "sys_platform == 'win32'" }]
+torchvision = [{ index = "pytorch-cu128", marker = "sys_platform == 'win32'" }]
+# PyPI has only an sdist for Windows, which needs MSVC to build; use the prebuilt CPU wheels.
+llama-cpp-python = [{ index = "llama-cpp-cpu", marker = "sys_platform == 'win32'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "llama-cpp-cpu"
+url = "https://abetlen.github.io/llama-cpp-python/whl/cpu"
+explicit = true
+
 [build-system]
 requires = ["uv_build>=0.9.18,<0.10.0"]
 build-backend = "uv_build"
@@ -69,6 +96,7 @@ select = ["E", "W", "F", "I", "UP", "B", "SIM", "RUF"]
 [tool.pytest.ini_options]
 markers = [
     "macos: tests that require macOS",
+    "windows: tests that require Windows",
     "hardware: tests that require audio hardware",
     "slow: slow-running tests",
 ]

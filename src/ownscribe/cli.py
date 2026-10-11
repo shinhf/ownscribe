@@ -82,7 +82,9 @@ def cli(
     # Apply CLI overrides
     if device is not None:
         config.audio.device = device
-        if config.audio.backend == "coreaudio" and device:
+        # Core Audio taps capture system audio, not a chosen device, so --device means
+        # a sounddevice input there. WASAPI keeps its backend: --device picks the speaker.
+        if config.audio.resolved_backend == "coreaudio" and device:
             config.audio.backend = "sounddevice"
     if no_summarize:
         config.summarization.enabled = False
@@ -133,10 +135,17 @@ def ask(ctx: click.Context, question: str, since: str | None, limit: int | None)
 
 
 @cli.command()
-def devices() -> None:
+@click.pass_context
+def devices(ctx: click.Context) -> None:
     """List available audio input devices."""
-    from ownscribe.audio.coreaudio import CoreAudioRecorder
-    recorder = CoreAudioRecorder()
+    if ctx.obj["config"].audio.resolved_backend == "wasapi":
+        from ownscribe.audio.wasapi_recorder import WasapiLoopbackRecorder
+
+        recorder = WasapiLoopbackRecorder()
+    else:
+        from ownscribe.audio.coreaudio import CoreAudioRecorder
+
+        recorder = CoreAudioRecorder()
     if recorder.is_available():
         click.echo(recorder.list_devices())
     else:

@@ -76,12 +76,49 @@ class TestMainCommand:
 
     def test_device_flag(self):
         runner = CliRunner()
-        with _mock_config(), mock.patch("ownscribe.pipeline.run_pipeline") as mock_run:
+        config = Config()
+        config.audio.backend = "coreaudio"
+        with _mock_config(config), mock.patch("ownscribe.pipeline.run_pipeline") as mock_run:
             result = runner.invoke(cli, ["--device", "USB Mic"])
             assert result.exit_code == 0
             config = mock_run.call_args[0][0]
             assert config.audio.device == "USB Mic"
             assert config.audio.backend == "sounddevice"
+
+    def test_device_flag_on_auto_backend_switches_only_on_macos(self):
+        runner = CliRunner()
+        with (
+            _mock_config(),
+            mock.patch("ownscribe.config.sys.platform", "darwin"),
+            mock.patch("ownscribe.pipeline.run_pipeline") as mock_run,
+        ):
+            runner.invoke(cli, ["--device", "USB Mic"])
+            assert mock_run.call_args[0][0].audio.backend == "sounddevice"
+
+    def test_device_flag_keeps_wasapi_as_speaker_selector(self):
+        runner = CliRunner()
+        config = Config()
+        config.audio.backend = "wasapi"
+        with _mock_config(config), mock.patch("ownscribe.pipeline.run_pipeline") as mock_run:
+            result = runner.invoke(cli, ["--device", "Headphones"])
+            assert result.exit_code == 0
+            config = mock_run.call_args[0][0]
+            assert config.audio.backend == "wasapi"
+            assert config.audio.device == "Headphones"
+
+    def test_devices_uses_wasapi_listing_on_windows(self):
+        runner = CliRunner()
+        config = Config()
+        config.audio.backend = "wasapi"
+        with (
+            _mock_config(config),
+            mock.patch("ownscribe.audio.wasapi_recorder.WasapiLoopbackRecorder") as mock_cls,
+        ):
+            mock_cls.return_value.is_available.return_value = True
+            mock_cls.return_value.list_devices.return_value = "Speakers (loopback)"
+            result = runner.invoke(cli, ["devices"])
+        assert result.exit_code == 0
+        assert "Speakers (loopback)" in result.output
 
     def test_model_flag(self):
         runner = CliRunner()

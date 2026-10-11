@@ -2,20 +2,19 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import re
-import select
 import signal
 import sys
-import termios
 import time
-import tty
 from datetime import datetime
 from pathlib import Path
 
 import click
 
 from ownscribe.config import Config
+from ownscribe.keyboard import key_reader
 from ownscribe.progress import (
     DownloadProgressEvent,
     PipelineProgress,
@@ -38,22 +37,28 @@ def _check_audio_silence(audio_path: Path) -> None:
         return  # Skip check if deps not available
 
     try:
-        # Read up to 5 seconds
+        # Scan block by block and stop at the first audible one. Windows loopback
+        # pads silent stretches with exact zeros, so a quiet first few seconds
+        # does not mean the whole recording is silent.
         info = sf.info(audio_path)
-        frames_to_read = min(int(info.samplerate * 5), info.frames)
-        data, _ = sf.read(audio_path, frames=frames_to_read, dtype="float32")
-        peak = float(np.max(np.abs(data)))
+        loud = any(
+            float(np.max(np.abs(block))) >= 1e-6
+            for block in sf.blocks(audio_path, blocksize=int(info.samplerate * 5), dtype="float32")
+            if block.size
+        )
     except Exception:
         return  # Don't block pipeline on check failure
 
-    if peak < 1e-6:
-        click.echo(
-            "\nError: Recorded audio is completely silent (peak amplitude ~0).\n"
-            "This usually means Screen Recording permission is missing.\n"
-            "Fix: System Settings > Privacy & Security > Screen Recording "
-            "— enable your terminal app, then restart it.\n",
-            err=True,
-        )
+    if not loud:
+        if sys.platform == "darwin":
+            hint = (
+                "This usually means Screen Recording permission is missing.\n"
+                "Fix: System Settings > Privacy & Security > Screen Recording "
+                "— enable your terminal app, then restart it.\n"
+            )
+        else:
+            hint = "Check that audio was playing on the selected device (see `ownscribe devices`).\n"
+        click.echo(f"\nError: Recorded audio is completely silent (peak amplitude ~0).\n{hint}", err=True)
         raise SystemExit(1)
 
 
@@ -79,9 +84,12 @@ def _rename_output_dir(directory: Path, title_slug: str) -> Path:
     logger = logging.getLogger(__name__)
     new_dir = directory.parent / f"{directory.name}_{title_slug}"
     try:
-        if new_dir.exists() and any(new_dir.iterdir()):
-            logger.debug("Not renaming output directory: %s already exists and is not empty", new_dir)
-            return directory
+        if new_dir.exists():
+            if any(new_dir.iterdir()):
+                logger.debug("Not renaming output directory: %s already exists and is not empty", new_dir)
+                return directory
+            # POSIX rename replaces an empty directory; Windows refuses, so remove it first.
+            new_dir.rmdir()
         directory.rename(new_dir)
         return new_dir
     except OSError as e:
@@ -110,7 +118,22 @@ def _unsupported_sounddevice_settings(config: Config) -> list[str]:
 
 def _create_recorder(config: Config):
     """Create the appropriate audio recorder based on config."""
-    if config.audio.backend == "coreaudio" and not config.audio.device:
+    backend = config.audio.resolved_backend
+    if backend == "wasapi":
+        from ownscribe.audio.wasapi_recorder import WasapiLoopbackRecorder
+
+        # --device names the speaker to loop back, not an input device.
+        wasapi = WasapiLoopbackRecorder(
+            mic=config.audio.mic,
+            mic_device=config.audio.mic_device,
+            device=config.audio.device,
+            silence_timeout=config.audio.silence_timeout,
+        )
+        if wasapi.is_available():
+            return wasapi
+        click.echo("WASAPI loopback (PyAudioWPatch) not available, falling back to sounddevice.")
+
+    if backend == "coreaudio" and not config.audio.device:
         from ownscribe.audio.coreaudio import CoreAudioRecorder
 
         recorder = CoreAudioRecorder(
@@ -218,9 +241,7 @@ def run_pipeline(config: Config) -> None:
     # 1. Record
     recorder = _create_recorder(config)
 
-    from ownscribe.audio.coreaudio import CoreAudioRecorder
-
-    can_mute = isinstance(recorder, CoreAudioRecorder) and config.audio.mic
+    can_mute = recorder.supports_mute
     is_tty = sys.stdin.isatty()
 
     hints = []
@@ -249,13 +270,10 @@ def run_pipeline(config: Config) -> None:
     original_handler = signal.getsignal(signal.SIGINT)
     signal.signal(signal.SIGINT, on_interrupt)
 
-    old_termios = None
-    if can_mute and is_tty:
-        old_termios = termios.tcgetattr(sys.stdin)
-        tty.setcbreak(sys.stdin.fileno())
-
     warned_no_data = False
-    try:
+    with contextlib.ExitStack() as stack:
+        stack.callback(signal.signal, signal.SIGINT, original_handler)
+        poll_key = stack.enter_context(key_reader()) if can_mute and is_tty else None
         while not stop_event and recorder.is_recording:
             elapsed = time.time() - start_time
             mins, secs = divmod(int(elapsed), 60)
@@ -275,20 +293,14 @@ def run_pipeline(config: Config) -> None:
                     err=True,
                 )
                 warned_no_data = True
-            if old_termios is not None:
-                readable, _, _ = select.select([sys.stdin], [], [], 0.5)
-                if readable:
-                    ch = sys.stdin.read(1)
-                    if ch in ("m", "M"):
-                        recorder.toggle_mute()
-                    elif ch == "\x03":
-                        stop_event = True
+            if poll_key is not None:
+                ch = poll_key(0.5)
+                if ch in ("m", "M"):
+                    recorder.toggle_mute()
+                elif ch == "\x03":
+                    stop_event = True
             else:
                 time.sleep(0.5)
-    finally:
-        if old_termios is not None:
-            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_termios)
-        signal.signal(signal.SIGINT, original_handler)
 
     recorder.stop()
     if getattr(recorder, "silence_timed_out", False):

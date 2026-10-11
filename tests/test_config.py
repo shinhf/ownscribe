@@ -3,17 +3,19 @@
 from __future__ import annotations
 
 import os
+import tomllib
 from pathlib import Path
 from unittest import mock
 
-from ownscribe.config import Config, OutputConfig, _merge_toml, ensure_config_file
-from ownscribe.transcription.whisperx_transcriber import WhisperXTranscriber
+import pytest
+
+from ownscribe.config import DEFAULT_CONFIG_TOML, AudioConfig, Config, OutputConfig, _merge_toml, ensure_config_file
 
 
 class TestDefaults:
     def test_default_audio_backend(self):
         cfg = Config()
-        assert cfg.audio.backend == "coreaudio"
+        assert cfg.audio.backend == "auto"
 
     def test_default_transcription_model(self):
         cfg = Config()
@@ -76,7 +78,7 @@ class TestMergeToml:
         merged = _merge_toml(cfg, data)
         assert merged.transcription.model == "small"
         # Other sections unchanged
-        assert merged.audio.backend == "coreaudio"
+        assert merged.audio.backend == "auto"
         assert merged.summarization.backend == "local"
 
     def test_mic_settings_from_toml(self):
@@ -172,20 +174,37 @@ class TestEnsureConfigFile:
         assert config_path.read_text() == "# custom config\n"
 
 
-class TestResolveDiarizationDevice:
-    def test_cpu_passthrough(self):
-        assert WhisperXTranscriber._resolve_diarization_device("cpu") == "cpu"
+class TestAudioBackendResolution:
+    @pytest.mark.parametrize(
+        ("platform", "expected"),
+        [("darwin", "coreaudio"), ("win32", "wasapi"), ("linux", "sounddevice")],
+    )
+    def test_auto_resolves_per_platform(self, platform, expected):
+        with mock.patch("ownscribe.config.sys.platform", platform):
+            assert AudioConfig(backend="auto").resolved_backend == expected
 
-    def test_mps_passthrough(self):
-        assert WhisperXTranscriber._resolve_diarization_device("mps") == "mps"
+    @pytest.mark.parametrize("backend", ["coreaudio", "wasapi", "sounddevice"])
+    def test_explicit_backend_passes_through(self, backend):
+        with mock.patch("ownscribe.config.sys.platform", "linux"):
+            assert AudioConfig(backend=backend).resolved_backend == backend
 
-    def test_auto_with_mps_available(self):
-        with mock.patch("torch.backends.mps.is_available", return_value=True):
-            assert WhisperXTranscriber._resolve_diarization_device("auto") == "mps"
 
-    def test_auto_without_mps(self):
-        with mock.patch("torch.backends.mps.is_available", return_value=False):
-            assert WhisperXTranscriber._resolve_diarization_device("auto") == "cpu"
+class TestTranscriptionDeviceConfig:
+    def test_defaults_are_auto(self):
+        cfg = Config()
+        assert cfg.transcription.device == "auto"
+        assert cfg.transcription.compute_type == "auto"
+
+    def test_merge_device_and_compute_type(self):
+        merged = _merge_toml(Config(), {"transcription": {"device": "cuda", "compute_type": "int8_float16"}})
+        assert merged.transcription.device == "cuda"
+        assert merged.transcription.compute_type == "int8_float16"
+
+    def test_default_toml_parses_with_new_keys(self):
+        data = tomllib.loads(DEFAULT_CONFIG_TOML)
+        assert data["audio"]["backend"] == "auto"
+        assert data["transcription"]["device"] == "auto"
+        assert data["transcription"]["compute_type"] == "auto"
 
 
 class TestResolvedDir:

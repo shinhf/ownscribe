@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -737,7 +738,7 @@ class TestEnsureModel:
             result = _ensure_model("hf:myorg/myrepo/model.gguf")
 
         mock_dl.assert_called_once_with(repo_id="myorg/myrepo", filename="model.gguf")
-        assert str(result) == "/fake/path.gguf"
+        assert result == Path("/fake/path.gguf")
 
     def test_hf_prefix_invalid(self):
         from ownscribe.summarization.llama_cpp_summarizer import _ensure_model
@@ -758,7 +759,7 @@ class TestEnsureModel:
             repo_id="unsloth/Phi-4-mini-instruct-GGUF",
             filename="Phi-4-mini-instruct-Q4_K_M.gguf",
         )
-        assert str(result) == "/fake/phi.gguf"
+        assert result == Path("/fake/phi.gguf")
 
     def test_direct_path(self, tmp_path):
         model_file = tmp_path / "my_model.gguf"

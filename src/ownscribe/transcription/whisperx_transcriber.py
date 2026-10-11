@@ -28,6 +28,25 @@ _SAMPLE_RATE = 16000
 _FALLBACK_THREADS = 4
 
 
+def resolve_torch_device(device_cfg: str) -> str:
+    """Concrete torch device for a configured one; "auto" prefers cuda, then mps, then cpu."""
+    if device_cfg != "auto":
+        return device_cfg
+
+    import torch
+
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def _ctranslate2_device(torch_device: str) -> str:
+    """CTranslate2 (Whisper) and the wav2vec2 aligner run on cuda or cpu; mps falls back to cpu."""
+    return "cuda" if torch_device == "cuda" else "cpu"
+
+
 class WhisperXTranscriber(Transcriber):
     """Transcribes audio using WhisperX (faster-whisper + optional pyannote diarization)."""
 
@@ -45,6 +64,7 @@ class WhisperXTranscriber(Transcriber):
         self._model = None
         self._align_models: dict[str, tuple[object, object]] = {}
         self._diarize_model = None
+        self._device: str | None = None
 
     def _will_diarize(self) -> bool:
         return bool(
@@ -72,11 +92,22 @@ class WhisperXTranscriber(Transcriber):
             return self._tx_config.threads
         return max(1, os.cpu_count() or _FALLBACK_THREADS)
 
+    def _compute_device(self) -> str:
+        """Device for Whisper and alignment: the resolved torch device, with mps mapped to cpu."""
+        if self._device is None:
+            self._device = _ctranslate2_device(resolve_torch_device(self._tx_config.device))
+        return self._device
+
+    def _resolve_compute_type(self, device: str) -> str:
+        if self._tx_config.compute_type != "auto":
+            return self._tx_config.compute_type
+        return "float16" if device == "cuda" else "int8"
+
     def _load_model(self):
         import whisperx
 
-        device = "cpu"
-        compute_type = "int8"
+        device = self._compute_device()
+        compute_type = self._resolve_compute_type(device)
         asr_options = {}
         if self._tx_config.initial_prompt:
             asr_options["initial_prompt"] = self._tx_config.initial_prompt
@@ -167,7 +198,7 @@ class WhisperXTranscriber(Transcriber):
             f"Loading alignment model ({language})",
             whisperx.load_align_model,
             language_code=language,
-            device="cpu",
+            device=self._compute_device(),
         )
         self._align_models[language] = (align_model, align_metadata)
         return align_model, align_metadata
@@ -178,7 +209,7 @@ class WhisperXTranscriber(Transcriber):
         if self._diarize_model is not None:
             return self._diarize_model
 
-        device = self._resolve_diarization_device(self._diar_config.device)
+        device = resolve_torch_device(self._diar_config.device)
         self._diarize_model = self._capture_download_output(
             step_key,
             "Loading diarization pipeline",
@@ -300,7 +331,7 @@ class WhisperXTranscriber(Transcriber):
                             align_model,
                             align_metadata,
                             audio,
-                            device="cpu",
+                            device=self._compute_device(),
                             return_char_alignments=False,
                             print_progress=True,
                             combined_progress=True,
@@ -340,14 +371,6 @@ class WhisperXTranscriber(Transcriber):
 
         duration = audio.shape[0] / float(_SAMPLE_RATE)
         return TranscriptResult(segments=segments, language=language, duration=duration)
-
-    @staticmethod
-    def _resolve_diarization_device(device_cfg: str) -> str:
-        if device_cfg == "auto":
-            import torch
-
-            return "mps" if torch.backends.mps.is_available() else "cpu"
-        return device_cfg
 
     def _diarize(self, audio, result):
         import pandas as pd
