@@ -457,6 +457,26 @@ class TestWhisperDevice:
         config = TranscriptionConfig(device="cuda", compute_type="int8_float16")
         assert self._load_model_args(config, cuda=False) == ("cuda", "int8_float16")
 
+    @pytest.mark.parametrize(
+        ("configured", "device", "expected"),
+        [(0, "cuda", 8), (0, "cpu", 16), (4, "cuda", 4), (32, "cpu", 32)],
+    )
+    def test_batch_size(self, configured, device, expected):
+        from ownscribe.config import TranscriptionConfig
+        from ownscribe.transcription.whisperx_transcriber import WhisperXTranscriber
+
+        transcriber = WhisperXTranscriber(TranscriptionConfig(batch_size=configured), None)
+        assert transcriber._resolve_batch_size(device) == expected
+
+    def test_load_model_sets_cuda_batch_size(self):
+        from ownscribe.config import TranscriptionConfig
+        from ownscribe.transcription.whisperx_transcriber import WhisperXTranscriber
+
+        transcriber = WhisperXTranscriber(TranscriptionConfig(), None)
+        with mock.patch.dict("sys.modules", {"whisperx": mock.MagicMock(), "torch": _fake_torch(cuda=True, mps=False)}):
+            transcriber._load_model()
+        assert transcriber._batch_size == 8
+
     def test_alignment_model_follows_whisper_device(self):
         from ownscribe.config import TranscriptionConfig
         from ownscribe.transcription.whisperx_transcriber import WhisperXTranscriber

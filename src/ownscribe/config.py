@@ -31,6 +31,7 @@ language = ""             # empty = auto-detect
 threads = 0               # CPU threads for transcription; 0 = auto-detect from core count
 device = "auto"           # "auto" (cuda > mps > cpu), "cuda", "mps", or "cpu"; Whisper runs on cpu for mps
 compute_type = "auto"     # "auto" (float16 on cuda, int8 otherwise) or any CTranslate2 type
+batch_size = 0            # segments per step; 0 = auto (8 on cuda, 16 otherwise); lower it on GPU out-of-memory
 # initial_prompt = ""     # prime Whisper with context: domain vocab, speaker names, expected phrases
 # hotwords = ""           # comma-separated words to boost recognition (softer hint than initial_prompt)
 
@@ -91,6 +92,7 @@ class TranscriptionConfig:
     threads: int = 0  # CPU threads for transcription; 0 = auto-detect from core count
     device: str = "auto"  # "auto" (cuda > mps > cpu), "cuda", "mps", or "cpu"
     compute_type: str = "auto"  # "auto" = float16 on cuda, int8 otherwise
+    batch_size: int = 0  # 0 = auto: 8 on cuda, 16 otherwise
 
 
 @dataclass

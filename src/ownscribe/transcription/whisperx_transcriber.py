@@ -24,6 +24,10 @@ from ownscribe.transcription.models import Segment, TranscriptResult, Word
 
 _SAMPLE_RATE = 16000
 
+# Default transcription batch sizes; overridable with transcription.batch_size.
+_CPU_BATCH_SIZE = 16
+_CUDA_BATCH_SIZE = 8
+
 # Used only when the core count cannot be determined.
 _FALLBACK_THREADS = 4
 
@@ -62,6 +66,8 @@ class WhisperXTranscriber(Transcriber):
         self._progress = progress or NullProgress()
         self._need_word_timestamps = need_word_timestamps
         self._model = None
+        # Set for real in _load_model, once the device is known.
+        self._batch_size = transcription_config.batch_size or _CPU_BATCH_SIZE
         self._align_models: dict[str, tuple[object, object]] = {}
         self._diarize_model = None
         self._device: str | None = None
@@ -103,11 +109,19 @@ class WhisperXTranscriber(Transcriber):
             return self._tx_config.compute_type
         return "float16" if device == "cuda" else "int8"
 
+    def _resolve_batch_size(self, device: str) -> int:
+        """Segments decoded per step. VRAM grows with it, so the GPU default is lower:
+        large-v3 at 16 runs out of memory on an 8 GB card even in int8."""
+        if self._tx_config.batch_size > 0:
+            return self._tx_config.batch_size
+        return _CUDA_BATCH_SIZE if device == "cuda" else _CPU_BATCH_SIZE
+
     def _load_model(self):
         import whisperx
 
         device = self._compute_device()
         compute_type = self._resolve_compute_type(device)
+        self._batch_size = self._resolve_batch_size(device)
         asr_options = {}
         if self._tx_config.initial_prompt:
             asr_options["initial_prompt"] = self._tx_config.initial_prompt
@@ -318,7 +332,10 @@ class WhisperXTranscriber(Transcriber):
                 # Nested redirect overrides devnull → captures progress
                 with contextlib.redirect_stdout(tx_writer):
                     result = self._model.transcribe(
-                        audio, batch_size=16, print_progress=True, combined_progress=True
+                        audio,
+                        batch_size=self._batch_size,
+                        print_progress=True,
+                        combined_progress=True,
                     )
 
                 language = result.get("language", "")
