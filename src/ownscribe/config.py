@@ -212,5 +212,5 @@ def ensure_config_file() -> Path:
     """Create default config file if it doesn't exist. Returns the path."""
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     if not CONFIG_PATH.exists():
-        CONFIG_PATH.write_text(DEFAULT_CONFIG_TOML)
+        CONFIG_PATH.write_text(DEFAULT_CONFIG_TOML, encoding="utf-8")
     return CONFIG_PATH

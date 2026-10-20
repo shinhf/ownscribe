@@ -460,7 +460,7 @@ def _load_transcript_text(transcript_path: Path) -> str:
     same normalised, speaker-aware text as the inline path. Falls back to the
     raw file contents for anything that is not a transcript ownscribe wrote.
     """
-    raw = transcript_path.read_text()
+    raw = transcript_path.read_text(encoding="utf-8")
 
     if transcript_path.suffix.lower() == ".json":
         from ownscribe.output.json_output import parse_transcript_json
@@ -538,7 +538,7 @@ def run_summarize(config: Config, transcript_file: str) -> None:
 
     summary_md = format_summary(summary)
     summary_path = out_dir / "summary.md"
-    summary_path.write_text(summary_md)
+    summary_path.write_text(summary_md, encoding="utf-8")
 
     if title_slug:
         out_dir, old_out_dir = _rename_output_dir(out_dir, title_slug), out_dir
@@ -600,7 +600,7 @@ def _do_transcribe_and_summarize(
         transcript_str, _ = _format_output(config, result)
         ext = "json" if config.output.format == "json" else "md"
         transcript_path = out_dir / f"transcript.{ext}"
-        transcript_path.write_text(transcript_str)
+        transcript_path.write_text(transcript_str, encoding="utf-8")
 
         if sum_enabled:
             try:
@@ -625,7 +625,7 @@ def _do_transcribe_and_summarize(
                         summary = summarizer.summarize(result.speaker_text)
                         _, summary_str = _format_output(config, result, summary)
                         summary_path = out_dir / f"summary.{ext}"
-                        summary_path.write_text(summary_str or summary)
+                        summary_path.write_text(summary_str or summary, encoding="utf-8")
                         title_slug = _generate_title_slug(summary, summarizer)
                         progress.complete("summarizing")
                     except Exception:

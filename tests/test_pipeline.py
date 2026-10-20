@@ -9,6 +9,8 @@ import signal
 import threading
 from unittest import mock
 
+import pytest
+
 from ownscribe.config import Config
 from ownscribe.keyboard import CTRL_C, CTRL_Q
 from ownscribe.transcription.models import Segment, TranscriptResult
@@ -586,6 +588,27 @@ class TestDoTranscribeAndSummarize:
         assert (tmp_path / "transcript.md").exists()
         assert not (tmp_path / "summary.md").exists()
 
+    @pytest.mark.parametrize(("fmt", "ext"), [("markdown", "md"), ("json", "json")])
+    def test_non_ascii_transcript_saved_as_utf8(self, tmp_path, fmt, ext):
+        from ownscribe.pipeline import _do_transcribe_and_summarize
+
+        config = Config()
+        config.output.format = fmt
+        audio_path = tmp_path / "recording.wav"
+        audio_path.touch()
+
+        mock_transcriber = mock.MagicMock()
+        # "ń" and "Ł" are not in cp1252, the default Windows code page.
+        mock_transcriber.transcribe.return_value = TranscriptResult(
+            segments=[Segment(text="Dzień dobry, Łódź.", start=0.0, end=1.5)],
+            language="pl",
+            duration=1.5,
+        )
+
+        with mock.patch("ownscribe.pipeline._create_transcriber", return_value=mock_transcriber):
+            _do_transcribe_and_summarize(config, audio_path, tmp_path, summarize=False)
+
+        assert "Dzień dobry, Łódź." in (tmp_path / f"transcript.{ext}").read_bytes().decode("utf-8")
 
     def test_transcribe_and_summarize(self, tmp_path):
         from ownscribe.pipeline import _do_transcribe_and_summarize
