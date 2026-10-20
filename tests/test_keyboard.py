@@ -37,7 +37,9 @@ class TestPosixKeyReader:
     def test_cbreak_is_restored_on_exit(self):
         fake_termios = types.SimpleNamespace(
             TCSADRAIN=1,
-            tcgetattr=mock.MagicMock(return_value=["saved"]),
+            TCSANOW=0,
+            IXON=0b100,
+            tcgetattr=mock.MagicMock(side_effect=[["saved"], [0b111]]),
             tcsetattr=mock.MagicMock(),
         )
         fake_tty = types.SimpleNamespace(setcbreak=mock.MagicMock())
@@ -52,5 +54,7 @@ class TestPosixKeyReader:
         ):
             with key_reader() as poll:
                 assert poll(0.5) == "m"
-            fake_termios.tcsetattr.assert_called_once_with(stdin, 1, ["saved"])
+                # Flow control is off so Ctrl+Q reaches poll().
+                fake_termios.tcsetattr.assert_called_once_with(stdin, 0, [0b011])
+            fake_termios.tcsetattr.assert_called_with(stdin, 1, ["saved"])
         fake_tty.setcbreak.assert_called_once()

@@ -5,9 +5,12 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import signal
+import threading
 from unittest import mock
 
 from ownscribe.config import Config
+from ownscribe.keyboard import CTRL_C, CTRL_Q
 from ownscribe.transcription.models import Segment, TranscriptResult
 
 
@@ -138,38 +141,110 @@ class TestRecordingLoopKeys:
         recorder.start.side_effect = lambda path: path.write_bytes(b"x" * 100)
         return recorder
 
-    def _run(self, tmp_path, recorder, keys):
+    def _run(self, tmp_path, recorder, keys, *, tty: bool = True):
+        """Run the pipeline and return the mocked transcription step."""
         from ownscribe.pipeline import run_pipeline
 
         config = Config()
         config.output.dir = str(tmp_path)
+        # The recording loop and the Ctrl+Q watcher thread share the key stream.
+        lock = threading.Lock()
+
+        def poll(_timeout):
+            with lock:
+                return next(keys, None)
 
         @contextlib.contextmanager
         def fake_key_reader():
-            yield lambda _timeout: next(keys, None)
+            yield poll
 
         with (
             mock.patch("ownscribe.pipeline._create_recorder", return_value=recorder),
-            mock.patch("ownscribe.pipeline._do_transcribe_and_summarize"),
+            mock.patch("ownscribe.pipeline._do_transcribe_and_summarize") as mock_ts,
             mock.patch("ownscribe.pipeline._check_audio_silence"),
-            mock.patch("ownscribe.pipeline.key_reader", side_effect=fake_key_reader) as mock_reader,
+            mock.patch("ownscribe.pipeline.key_reader", side_effect=fake_key_reader),
             mock.patch("ownscribe.pipeline.sys.stdin") as stdin,
+            mock.patch("ownscribe.pipeline.time.sleep"),
         ):
-            stdin.isatty.return_value = True
+            stdin.isatty.return_value = tty
             run_pipeline(config)
-        return mock_reader
+        return mock_ts
 
     def test_m_toggles_mute(self, tmp_path):
         recorder = self._recorder(supports_mute=True)
         self._run(tmp_path, recorder, iter(["m"]))
         recorder.toggle_mute.assert_called_once()
 
-    def test_no_key_reader_without_mute_support(self, tmp_path):
+    def test_m_ignored_without_mute_support(self, tmp_path):
         recorder = self._recorder(supports_mute=False)
-        with mock.patch("ownscribe.pipeline.time.sleep"):
-            mock_reader = self._run(tmp_path, recorder, iter(["m"]))
-        mock_reader.assert_not_called()
+        self._run(tmp_path, recorder, iter(["m"]))
         recorder.toggle_mute.assert_not_called()
+
+    def test_ctrl_c_key_stops_and_transcribes(self, tmp_path):
+        recorder = self._recorder(supports_mute=False)
+        type(recorder).is_recording = mock.PropertyMock(return_value=True)
+        mock_ts = self._run(tmp_path, recorder, iter([CTRL_C]))
+        recorder.stop.assert_called_once()
+        mock_ts.assert_called_once()
+
+    def test_ctrl_q_stops_without_transcribing(self, tmp_path, capsys):
+        recorder = self._recorder(supports_mute=False)
+        type(recorder).is_recording = mock.PropertyMock(return_value=True)
+        mock_ts = self._run(tmp_path, recorder, iter([CTRL_Q]))
+        recorder.stop.assert_called_once()
+        mock_ts.assert_not_called()
+        assert "ownscribe transcribe" in capsys.readouterr().out
+
+    def test_sigint_after_stop_does_not_abort(self, tmp_path, capsys):
+        recorder = self._recorder(supports_mute=False)
+        # A Ctrl+C that lands while the finished recording is being saved.
+        recorder.stop.side_effect = lambda: signal.getsignal(signal.SIGINT)(signal.SIGINT, None)
+        mock_ts = self._run(tmp_path, recorder, iter([]), tty=False)
+        mock_ts.assert_called_once()
+        assert "Ctrl+Q" in capsys.readouterr().err
+
+    def test_sigint_handler_restored(self, tmp_path):
+        before = signal.getsignal(signal.SIGINT)
+        self._run(tmp_path, self._recorder(supports_mute=False), iter([]))
+        assert signal.getsignal(signal.SIGINT) is before
+
+
+class TestQuitWatcher:
+    """Ctrl+Q while a finished recording is processed exits the process."""
+
+    def test_ctrl_q_exits(self, tmp_path):
+        from ownscribe.pipeline import _watch_for_quit
+
+        @contextlib.contextmanager
+        def fake_key_reader():
+            yield lambda _timeout: CTRL_Q
+
+        with (
+            mock.patch("ownscribe.pipeline.key_reader", side_effect=fake_key_reader),
+            mock.patch("ownscribe.pipeline.os._exit") as mock_exit,
+        ):
+            _watch_for_quit(threading.Event(), tmp_path)
+        mock_exit.assert_called_once_with(130)
+
+    def test_returns_when_done(self, tmp_path):
+        from ownscribe.pipeline import _watch_for_quit
+
+        done = threading.Event()
+
+        @contextlib.contextmanager
+        def fake_key_reader():
+            def poll(_timeout):
+                done.set()
+                return "x"
+
+            yield poll
+
+        with (
+            mock.patch("ownscribe.pipeline.key_reader", side_effect=fake_key_reader),
+            mock.patch("ownscribe.pipeline.os._exit") as mock_exit,
+        ):
+            _watch_for_quit(done, tmp_path)
+        mock_exit.assert_not_called()
 
 
 class TestUnsupportedAudioSettings:
@@ -510,6 +585,7 @@ class TestDoTranscribeAndSummarize:
 
         assert (tmp_path / "transcript.md").exists()
         assert not (tmp_path / "summary.md").exists()
+
 
     def test_transcribe_and_summarize(self, tmp_path):
         from ownscribe.pipeline import _do_transcribe_and_summarize

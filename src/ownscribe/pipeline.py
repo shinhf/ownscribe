@@ -4,17 +4,20 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
 import re
 import signal
 import sys
+import threading
 import time
+from collections.abc import Iterator
 from datetime import datetime
 from pathlib import Path
 
 import click
 
 from ownscribe.config import Config
-from ownscribe.keyboard import key_reader
+from ownscribe.keyboard import CTRL_C, CTRL_Q, key_reader
 from ownscribe.progress import (
     DownloadProgressEvent,
     PipelineProgress,
@@ -232,6 +235,47 @@ def _generate_title_slug(summary: str, summarizer) -> str:
         return ""
 
 
+def _watch_for_quit(done: threading.Event, audio_dir: Path) -> None:
+    """Exit the process at once when Ctrl+Q is pressed, until ``done`` is set."""
+    quit_pressed = False
+    with key_reader() as poll_key:
+        while not done.is_set():
+            if poll_key(0.2) == CTRL_Q:
+                quit_pressed = True
+                break
+    # Leave key_reader first so the terminal mode is restored; os._exit skips cleanup.
+    if quit_pressed:
+        click.echo(f"\n\nQuit. Recorded audio is kept in {audio_dir}", err=True)
+        os._exit(130)
+
+
+@contextlib.contextmanager
+def _finishing_guard(is_tty: bool, audio_dir: Path) -> Iterator[None]:
+    """Keep Ctrl+C from killing the work on a finished recording; Ctrl+Q still quits.
+
+    Mixing and transcribing a long recording runs for minutes, and a repeated
+    Ctrl+C there would otherwise abort the job and lose the transcript.
+    """
+
+    def on_interrupt(sig, frame):
+        click.echo("\n  Recording already stopped, finishing the transcript. Press Ctrl+Q to quit.", err=True)
+
+    original_handler = signal.getsignal(signal.SIGINT)
+    signal.signal(signal.SIGINT, on_interrupt)
+    done = threading.Event()
+    watcher = None
+    if is_tty:
+        watcher = threading.Thread(target=_watch_for_quit, args=(done, audio_dir), name="quit-watcher", daemon=True)
+        watcher.start()
+    try:
+        yield
+    finally:
+        done.set()
+        if watcher is not None:
+            watcher.join()
+        signal.signal(signal.SIGINT, original_handler)
+
+
 def run_pipeline(config: Config) -> None:
     """Run the full pipeline: record, transcribe, summarize, output."""
     out_dir = _get_output_dir(config)
@@ -256,12 +300,15 @@ def run_pipeline(config: Config) -> None:
             hints.append(f"Auto-stops after {mins}m of silence.")
         else:
             hints.append(f"Auto-stops after {silence_timeout}s of silence.")
-    hints.append("Press Ctrl+C to stop.")
+    hints.append("Press Ctrl+C to stop and transcribe.")
+    if is_tty:
+        hints.append("Press Ctrl+Q to stop without transcribing.")
     click.echo(f"Starting recording... {' '.join(hints)}\n")
     recorder.start(audio_path)
 
     start_time = time.time()
     stop_event = False
+    quit_requested = False
 
     def on_interrupt(sig, frame):
         nonlocal stop_event
@@ -273,7 +320,7 @@ def run_pipeline(config: Config) -> None:
     warned_no_data = False
     with contextlib.ExitStack() as stack:
         stack.callback(signal.signal, signal.SIGINT, original_handler)
-        poll_key = stack.enter_context(key_reader()) if can_mute and is_tty else None
+        poll_key = stack.enter_context(key_reader()) if is_tty else None
         while not stop_event and recorder.is_recording:
             elapsed = time.time() - start_time
             mins, secs = divmod(int(elapsed), 60)
@@ -295,18 +342,27 @@ def run_pipeline(config: Config) -> None:
                 warned_no_data = True
             if poll_key is not None:
                 ch = poll_key(0.5)
-                if ch in ("m", "M"):
+                if ch in ("m", "M") and can_mute:
                     recorder.toggle_mute()
-                elif ch == "\x03":
+                elif ch == CTRL_C:
                     stop_event = True
+                elif ch == CTRL_Q:
+                    stop_event = True
+                    quit_requested = True
             else:
                 time.sleep(0.5)
 
+    with _finishing_guard(is_tty, audio_dir):
+        _finish_recording(config, recorder, audio_path, out_dir, transcribe=not quit_requested)
+
+
+def _finish_recording(config: Config, recorder, audio_path: Path, out_dir: Path, *, transcribe: bool) -> None:
+    """Stop the recorder, check the saved audio and, unless told not to, transcribe it."""
+    # Saving can take a while (the Windows recorder mixes its tracks), so say so before it starts.
+    click.echo("\n\nStopping recording and saving audio...")
     recorder.stop()
     if getattr(recorder, "silence_timed_out", False):
-        click.echo("\n\nRecording auto-stopped after silence timeout.")
-    else:
-        click.echo("\n\nStopping recording...")
+        click.echo("Recording auto-stopped after silence timeout.")
 
     if not audio_path.exists() or audio_path.stat().st_size <= _WAV_HEADER_SIZE:
         message = (
@@ -321,6 +377,9 @@ def run_pipeline(config: Config) -> None:
         raise SystemExit(1)
 
     click.echo(f"Audio saved to {audio_path}\n")
+    if not transcribe:
+        click.echo(f'Skipped transcription. Run it later with:\n  ownscribe transcribe "{audio_path}"')
+        return
 
     # Check for silent audio before spending time on transcription
     # Skip if the recorder already reported a silence warning (CoreAudio helper)

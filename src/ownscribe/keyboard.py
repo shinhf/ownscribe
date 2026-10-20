@@ -9,6 +9,9 @@ from contextlib import contextmanager
 
 KeyPoll = Callable[[float], str | None]
 
+CTRL_C = "\x03"
+CTRL_Q = "\x11"
+
 # msvcrt has no blocking-with-timeout read, so the wait is sliced into short sleeps.
 _WINDOWS_POLL_SLICE = 0.05
 
@@ -48,6 +51,10 @@ def _posix_cbreak() -> Iterator[KeyPoll]:
 
     old_termios = termios.tcgetattr(sys.stdin)
     tty.setcbreak(sys.stdin.fileno())
+    # Ctrl+Q is XON flow control by default; turn that off so the key reaches poll().
+    attrs = termios.tcgetattr(sys.stdin)
+    attrs[0] &= ~termios.IXON
+    termios.tcsetattr(sys.stdin, termios.TCSANOW, attrs)
 
     def poll(timeout: float) -> str | None:
         readable, _, _ = select.select([sys.stdin], [], [], timeout)
