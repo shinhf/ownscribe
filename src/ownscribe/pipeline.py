@@ -2,20 +2,22 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
+import os
 import re
-import select
 import signal
 import sys
-import termios
+import threading
 import time
-import tty
+from collections.abc import Iterator
 from datetime import datetime
 from pathlib import Path
 
 import click
 
 from ownscribe.config import Config
+from ownscribe.keyboard import CTRL_C, CTRL_Q, key_reader
 from ownscribe.progress import (
     DownloadProgressEvent,
     PipelineProgress,
@@ -38,22 +40,28 @@ def _check_audio_silence(audio_path: Path) -> None:
         return  # Skip check if deps not available
 
     try:
-        # Read up to 5 seconds
+        # Scan block by block and stop at the first audible one. Windows loopback
+        # pads silent stretches with exact zeros, so a quiet first few seconds
+        # does not mean the whole recording is silent.
         info = sf.info(audio_path)
-        frames_to_read = min(int(info.samplerate * 5), info.frames)
-        data, _ = sf.read(audio_path, frames=frames_to_read, dtype="float32")
-        peak = float(np.max(np.abs(data)))
+        loud = any(
+            float(np.max(np.abs(block))) >= 1e-6
+            for block in sf.blocks(audio_path, blocksize=int(info.samplerate * 5), dtype="float32")
+            if block.size
+        )
     except Exception:
         return  # Don't block pipeline on check failure
 
-    if peak < 1e-6:
-        click.echo(
-            "\nError: Recorded audio is completely silent (peak amplitude ~0).\n"
-            "This usually means Screen Recording permission is missing.\n"
-            "Fix: System Settings > Privacy & Security > Screen Recording "
-            "— enable your terminal app, then restart it.\n",
-            err=True,
-        )
+    if not loud:
+        if sys.platform == "darwin":
+            hint = (
+                "This usually means Screen Recording permission is missing.\n"
+                "Fix: System Settings > Privacy & Security > Screen Recording "
+                "— enable your terminal app, then restart it.\n"
+            )
+        else:
+            hint = "Check that audio was playing on the selected device (see `ownscribe devices`).\n"
+        click.echo(f"\nError: Recorded audio is completely silent (peak amplitude ~0).\n{hint}", err=True)
         raise SystemExit(1)
 
 
@@ -79,9 +87,12 @@ def _rename_output_dir(directory: Path, title_slug: str) -> Path:
     logger = logging.getLogger(__name__)
     new_dir = directory.parent / f"{directory.name}_{title_slug}"
     try:
-        if new_dir.exists() and any(new_dir.iterdir()):
-            logger.debug("Not renaming output directory: %s already exists and is not empty", new_dir)
-            return directory
+        if new_dir.exists():
+            if any(new_dir.iterdir()):
+                logger.debug("Not renaming output directory: %s already exists and is not empty", new_dir)
+                return directory
+            # POSIX rename replaces an empty directory; Windows refuses, so remove it first.
+            new_dir.rmdir()
         directory.rename(new_dir)
         return new_dir
     except OSError as e:
@@ -110,7 +121,22 @@ def _unsupported_sounddevice_settings(config: Config) -> list[str]:
 
 def _create_recorder(config: Config):
     """Create the appropriate audio recorder based on config."""
-    if config.audio.backend == "coreaudio" and not config.audio.device:
+    backend = config.audio.resolved_backend
+    if backend == "wasapi":
+        from ownscribe.audio.wasapi_recorder import WasapiLoopbackRecorder
+
+        # --device names the speaker to loop back, not an input device.
+        wasapi = WasapiLoopbackRecorder(
+            mic=config.audio.mic,
+            mic_device=config.audio.mic_device,
+            device=config.audio.device,
+            silence_timeout=config.audio.silence_timeout,
+        )
+        if wasapi.is_available():
+            return wasapi
+        click.echo("WASAPI loopback (PyAudioWPatch) not available, falling back to sounddevice.")
+
+    if backend == "coreaudio" and not config.audio.device:
         from ownscribe.audio.coreaudio import CoreAudioRecorder
 
         recorder = CoreAudioRecorder(
@@ -209,6 +235,47 @@ def _generate_title_slug(summary: str, summarizer) -> str:
         return ""
 
 
+def _watch_for_quit(done: threading.Event, audio_dir: Path) -> None:
+    """Exit the process at once when Ctrl+Q is pressed, until ``done`` is set."""
+    quit_pressed = False
+    with key_reader() as poll_key:
+        while not done.is_set():
+            if poll_key(0.2) == CTRL_Q:
+                quit_pressed = True
+                break
+    # Leave key_reader first so the terminal mode is restored; os._exit skips cleanup.
+    if quit_pressed:
+        click.echo(f"\n\nQuit. Recorded audio is kept in {audio_dir}", err=True)
+        os._exit(130)
+
+
+@contextlib.contextmanager
+def _finishing_guard(is_tty: bool, audio_dir: Path) -> Iterator[None]:
+    """Keep Ctrl+C from killing the work on a finished recording; Ctrl+Q still quits.
+
+    Mixing and transcribing a long recording runs for minutes, and a repeated
+    Ctrl+C there would otherwise abort the job and lose the transcript.
+    """
+
+    def on_interrupt(sig, frame):
+        click.echo("\n  Recording already stopped, finishing the transcript. Press Ctrl+Q to quit.", err=True)
+
+    original_handler = signal.getsignal(signal.SIGINT)
+    signal.signal(signal.SIGINT, on_interrupt)
+    done = threading.Event()
+    watcher = None
+    if is_tty:
+        watcher = threading.Thread(target=_watch_for_quit, args=(done, audio_dir), name="quit-watcher", daemon=True)
+        watcher.start()
+    try:
+        yield
+    finally:
+        done.set()
+        if watcher is not None:
+            watcher.join()
+        signal.signal(signal.SIGINT, original_handler)
+
+
 def run_pipeline(config: Config) -> None:
     """Run the full pipeline: record, transcribe, summarize, output."""
     out_dir = _get_output_dir(config)
@@ -218,9 +285,7 @@ def run_pipeline(config: Config) -> None:
     # 1. Record
     recorder = _create_recorder(config)
 
-    from ownscribe.audio.coreaudio import CoreAudioRecorder
-
-    can_mute = isinstance(recorder, CoreAudioRecorder) and config.audio.mic
+    can_mute = recorder.supports_mute
     is_tty = sys.stdin.isatty()
 
     hints = []
@@ -235,12 +300,15 @@ def run_pipeline(config: Config) -> None:
             hints.append(f"Auto-stops after {mins}m of silence.")
         else:
             hints.append(f"Auto-stops after {silence_timeout}s of silence.")
-    hints.append("Press Ctrl+C to stop.")
+    hints.append("Press Ctrl+C to stop and transcribe.")
+    if is_tty:
+        hints.append("Press Ctrl+Q to stop without transcribing.")
     click.echo(f"Starting recording... {' '.join(hints)}\n")
     recorder.start(audio_path)
 
     start_time = time.time()
     stop_event = False
+    quit_requested = False
 
     def on_interrupt(sig, frame):
         nonlocal stop_event
@@ -249,13 +317,10 @@ def run_pipeline(config: Config) -> None:
     original_handler = signal.getsignal(signal.SIGINT)
     signal.signal(signal.SIGINT, on_interrupt)
 
-    old_termios = None
-    if can_mute and is_tty:
-        old_termios = termios.tcgetattr(sys.stdin)
-        tty.setcbreak(sys.stdin.fileno())
-
     warned_no_data = False
-    try:
+    with contextlib.ExitStack() as stack:
+        stack.callback(signal.signal, signal.SIGINT, original_handler)
+        poll_key = stack.enter_context(key_reader()) if is_tty else None
         while not stop_event and recorder.is_recording:
             elapsed = time.time() - start_time
             mins, secs = divmod(int(elapsed), 60)
@@ -275,26 +340,29 @@ def run_pipeline(config: Config) -> None:
                     err=True,
                 )
                 warned_no_data = True
-            if old_termios is not None:
-                readable, _, _ = select.select([sys.stdin], [], [], 0.5)
-                if readable:
-                    ch = sys.stdin.read(1)
-                    if ch in ("m", "M"):
-                        recorder.toggle_mute()
-                    elif ch == "\x03":
-                        stop_event = True
+            if poll_key is not None:
+                ch = poll_key(0.5)
+                if ch in ("m", "M") and can_mute:
+                    recorder.toggle_mute()
+                elif ch == CTRL_C:
+                    stop_event = True
+                elif ch == CTRL_Q:
+                    stop_event = True
+                    quit_requested = True
             else:
                 time.sleep(0.5)
-    finally:
-        if old_termios is not None:
-            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_termios)
-        signal.signal(signal.SIGINT, original_handler)
 
+    with _finishing_guard(is_tty, audio_dir):
+        _finish_recording(config, recorder, audio_path, out_dir, transcribe=not quit_requested)
+
+
+def _finish_recording(config: Config, recorder, audio_path: Path, out_dir: Path, *, transcribe: bool) -> None:
+    """Stop the recorder, check the saved audio and, unless told not to, transcribe it."""
+    # Saving can take a while (the Windows recorder mixes its tracks), so say so before it starts.
+    click.echo("\n\nStopping recording and saving audio...")
     recorder.stop()
     if getattr(recorder, "silence_timed_out", False):
-        click.echo("\n\nRecording auto-stopped after silence timeout.")
-    else:
-        click.echo("\n\nStopping recording...")
+        click.echo("Recording auto-stopped after silence timeout.")
 
     if not audio_path.exists() or audio_path.stat().st_size <= _WAV_HEADER_SIZE:
         message = (
@@ -309,6 +377,9 @@ def run_pipeline(config: Config) -> None:
         raise SystemExit(1)
 
     click.echo(f"Audio saved to {audio_path}\n")
+    if not transcribe:
+        click.echo(f'Skipped transcription. Run it later with:\n  ownscribe transcribe "{audio_path}"')
+        return
 
     # Check for silent audio before spending time on transcription
     # Skip if the recorder already reported a silence warning (CoreAudio helper)
@@ -389,7 +460,7 @@ def _load_transcript_text(transcript_path: Path) -> str:
     same normalised, speaker-aware text as the inline path. Falls back to the
     raw file contents for anything that is not a transcript ownscribe wrote.
     """
-    raw = transcript_path.read_text()
+    raw = transcript_path.read_text(encoding="utf-8")
 
     if transcript_path.suffix.lower() == ".json":
         from ownscribe.output.json_output import parse_transcript_json
@@ -467,7 +538,7 @@ def run_summarize(config: Config, transcript_file: str) -> None:
 
     summary_md = format_summary(summary)
     summary_path = out_dir / "summary.md"
-    summary_path.write_text(summary_md)
+    summary_path.write_text(summary_md, encoding="utf-8")
 
     if title_slug:
         out_dir, old_out_dir = _rename_output_dir(out_dir, title_slug), out_dir
@@ -529,7 +600,7 @@ def _do_transcribe_and_summarize(
         transcript_str, _ = _format_output(config, result)
         ext = "json" if config.output.format == "json" else "md"
         transcript_path = out_dir / f"transcript.{ext}"
-        transcript_path.write_text(transcript_str)
+        transcript_path.write_text(transcript_str, encoding="utf-8")
 
         if sum_enabled:
             try:
@@ -554,7 +625,7 @@ def _do_transcribe_and_summarize(
                         summary = summarizer.summarize(result.speaker_text)
                         _, summary_str = _format_output(config, result, summary)
                         summary_path = out_dir / f"summary.{ext}"
-                        summary_path.write_text(summary_str or summary)
+                        summary_path.write_text(summary_str or summary, encoding="utf-8")
                         title_slug = _generate_title_slug(summary, summarizer)
                         progress.complete("summarizing")
                     except Exception:

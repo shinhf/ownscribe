@@ -8,7 +8,7 @@
 Local-first meeting transcription and summarization CLI.
 Record, transcribe, and summarize meetings and system audio entirely on your machine – no cloud, no bots, no data leaving your device.
 
-> System audio capture requires **macOS 14.2 or later**. Other platforms can use the sounddevice backend with an external audio source.
+> System audio capture requires **macOS 14.2 or later** or **Windows** (WASAPI loopback, see [Windows](#windows)). Other platforms can use the sounddevice backend with an external audio source.
 
 ## Table of Contents
 
@@ -142,6 +142,33 @@ Alternatively, activate the environment once (`source .venv/bin/activate`) and
 then call `ownscribe` directly. The examples in [Usage](#usage) use the bare
 `ownscribe` form, which works after activation or via `uvx ownscribe`.
 
+### Windows
+
+On Windows, ownscribe records what plays on your speakers through **WASAPI loopback**
+([PyAudioWPatch](https://github.com/s0d3s/PyAudioWPatch), installed automatically), mixed with the
+microphone. No virtual audio cable is needed. Press `m` to mute or unmute the mic while recording.
+
+From a source checkout, `uv sync --extra all` installs a CUDA 12.8 build of PyTorch on Windows (the
+`pytorch-cu128` index in `pyproject.toml`). CUDA 12.8 is needed for RTX 50-series (Blackwell) GPUs.
+`llama-cpp-python` comes from its prebuilt CPU wheel index, so no compiler is needed. `uv tool install`
+does not read the project's `[tool.uv.sources]`, so pass the indexes yourself:
+
+```powershell
+uv tool install --editable ".[all]" --python 3.12 `
+  --index pytorch-cu128=https://download.pytorch.org/whl/cu128 `
+  --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu `
+  --index-strategy unsafe-best-match
+```
+
+Check that the GPU is visible with
+`python -c "import torch; print(torch.__version__, torch.cuda.is_available())"`, which should print
+`...+cu128 True`. With `device = "auto"` (the default), Whisper then runs on CUDA with `float16`, and
+alignment and diarization also run on the GPU. Without CUDA, everything falls back to the CPU with `int8`.
+
+On Windows, `--device` selects the **speaker** to loop back (a name substring or the index shown by
+`ownscribe devices`). It does not select an input device. Use `--mic-device` for the microphone. ffmpeg
+must be on `PATH` (for example `winget install Gyan.FFmpeg`).
+
 ## Usage
 
 ### Record, transcribe, and summarize a meeting
@@ -165,7 +192,7 @@ On first run, WhisperX / pyannote and the summarization model may download model
 ```bash
 ownscribe --no-mic                            # capture system audio only (the mic is on by default)
 ownscribe --mic-device "MacBook Pro Microphone" # capture system audio + a specific mic instead of the default one
-ownscribe --device "MacBook Pro Microphone"   # use mic instead of system audio
+ownscribe --device "MacBook Pro Microphone"   # use mic instead of system audio (Windows: pick the speaker to record)
 ownscribe --no-summarize                      # skip LLM summarization
 ownscribe --diarize                           # enable speaker identification
 ownscribe --language en                       # set transcription language (default: auto-detect)
@@ -180,7 +207,7 @@ ownscribe --silence-timeout 0                 # disable silence auto-stop
 ### Subcommands
 
 ```bash
-ownscribe devices                  # list audio devices (uses native CoreAudio when available)
+ownscribe devices                  # list audio devices (CoreAudio on macOS, WASAPI speakers + mics on Windows)
 ownscribe apps                     # list running apps with PIDs for use with --pid
 ownscribe warmup                   # prefetch WhisperX/pyannote models before a meeting
 ownscribe transcribe recording.wav # transcribe an audio or video file: wav/mp3/mp4/mov/mkv (saved alongside)
@@ -223,8 +250,9 @@ Config is stored at `~/.config/ownscribe/config.toml`. Run `ownscribe config` to
 
 ```toml
 [audio]
-backend = "coreaudio"     # "coreaudio" or "sounddevice"
-device = ""               # empty = system audio
+backend = "auto"          # "auto" (coreaudio on macOS, wasapi on Windows, else sounddevice),
+                          # "coreaudio", "wasapi", or "sounddevice"
+device = ""               # empty = system audio; wasapi: speaker to loop back; sounddevice: input device
 mic = true                # also capture microphone input
 mic_device = ""           # specific mic device name (empty = default)
 capture_mode = "all"      # "all" = capture all system audio directly; "picker" = show source picker
@@ -234,6 +262,8 @@ silence_timeout = 300     # seconds of silence before auto-stop; 0 = disabled
 model = "base"            # tiny, base, small, medium, large-v3
 language = ""             # empty = auto-detect
 threads = 0               # CPU threads for transcription; 0 = auto-detect from core count
+device = "auto"           # "auto" (cuda > mps > cpu), "cuda", "mps", or "cpu"; Whisper runs on cpu for mps
+compute_type = "auto"     # "auto" (float16 on cuda, int8 otherwise) or any CTranslate2 type
 # initial_prompt = ""     # prime Whisper with context: domain vocab, speaker names, expected phrases
 # hotwords = ""           # comma-separated words to boost recognition (softer hint than initial_prompt)
 
@@ -241,7 +271,7 @@ threads = 0               # CPU threads for transcription; 0 = auto-detect from 
 enabled = false
 hf_token = ""             # HuggingFace token for pyannote
 telemetry = false         # allow HuggingFace Hub + pyannote metrics telemetry
-device = "auto"           # "auto" (mps if available), "mps", or "cpu"
+device = "auto"           # "auto" (cuda > mps > cpu), "cuda", "mps", or "cpu"
 
 [summarization]
 enabled = true
@@ -306,7 +336,7 @@ Speaker identification requires a HuggingFace token with access to the pyannote 
 3. Set `HF_TOKEN` env var or add `hf_token` to config
 4. Run with `--diarize`
 
-On Apple Silicon Macs, diarization automatically uses the Metal Performance Shaders (MPS) GPU backend for ~10x faster processing. Set `device = "cpu"` in the `[diarization]` config section to disable this.
+Diarization automatically uses an NVIDIA GPU (CUDA) when available, or the Metal Performance Shaders (MPS) GPU backend on Apple Silicon Macs, for ~10x faster processing. Set `device = "cpu"` in the `[diarization]` config section to disable this.
 
 ## Acknowledgments
 

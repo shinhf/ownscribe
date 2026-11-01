@@ -10,9 +10,7 @@ import numpy as np
 import sounddevice as sd
 import soundfile as sf
 
-from ownscribe.audio.base import AudioRecorder
-
-_SILENCE_THRESHOLD = 1e-4  # ~-80 dB
+from ownscribe.audio.base import _SILENCE_THRESHOLD, AudioRecorder
 
 
 class SoundDeviceRecorder(AudioRecorder):

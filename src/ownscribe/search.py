@@ -191,7 +191,7 @@ def _build_summary_chunks(
     current_size = 0
 
     for m in meetings:
-        summary_text = m.summary_path.read_text()
+        summary_text = m.summary_path.read_text(encoding="utf-8")
         header = f"## [{m.folder_name}]\n"
         entry_tokens = summarizer.count_tokens(header + summary_text)
 
@@ -291,13 +291,13 @@ def _keyword_fallback(
 
     matches: list[Meeting] = []
     for m in meetings:
-        summary_text = m.summary_path.read_text()
+        summary_text = m.summary_path.read_text(encoding="utf-8")
         summary_words = set(re.findall(r"[a-z]+", summary_text.lower()))
         if kw & summary_words:
             matches.append(m)
             continue
         if m.transcript_path and m.transcript_path.exists():
-            transcript_text = m.transcript_path.read_text()
+            transcript_text = m.transcript_path.read_text(encoding="utf-8")
             transcript_words = set(re.findall(r"[a-z]+", transcript_text.lower()))
             if kw & transcript_words:
                 matches.append(m)
@@ -324,7 +324,7 @@ def _find_relevant_meetings(
         # Build summaries text
         summaries_parts = []
         for m in chunk:
-            summary_text = m.summary_path.read_text()
+            summary_text = m.summary_path.read_text(encoding="utf-8")
             summaries_parts.append(f"## [{m.folder_name}]\n{summary_text}")
         summaries = "\n\n".join(summaries_parts)
 
@@ -360,7 +360,7 @@ def _rank_meetings(question: str, meetings: list[Meeting]) -> list[Meeting]:
     question_words = set(question.lower().split())
 
     def score(m: Meeting) -> tuple[float, float, str]:
-        summary_text = m.summary_path.read_text().lower()
+        summary_text = m.summary_path.read_text(encoding="utf-8").lower()
         summary_words = set(summary_text.split())
 
         # Keyword overlap
@@ -387,7 +387,7 @@ def _load_transcripts(meetings: list[Meeting]) -> dict[str, str]:
     transcripts: dict[str, str] = {}
     for m in meetings:
         if m.transcript_path and m.transcript_path.exists():
-            transcripts[m.folder_name] = m.transcript_path.read_text()
+            transcripts[m.folder_name] = m.transcript_path.read_text(encoding="utf-8")
     return transcripts
 
 
@@ -410,7 +410,7 @@ def _answer_from_transcripts(
             skipped += 1
             continue
 
-        text = m.transcript_path.read_text()
+        text = m.transcript_path.read_text(encoding="utf-8")
         entry = f"## [{m.folder_name}] {m.display_name}\n{text}"
         entry_tokens = summarizer.count_tokens(entry)
 

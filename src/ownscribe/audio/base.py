@@ -5,6 +5,9 @@ from __future__ import annotations
 import abc
 from pathlib import Path
 
+# Peak amplitude below which a buffer counts as silence for auto-stop (~-80 dB).
+_SILENCE_THRESHOLD = 1e-4
+
 
 class AudioRecorder(abc.ABC):
     """Base class for audio recording backends."""
@@ -27,6 +30,11 @@ class AudioRecorder(abc.ABC):
     @property
     def is_muted(self) -> bool:
         """Whether the microphone is currently muted."""
+        return False
+
+    @property
+    def supports_mute(self) -> bool:
+        """Whether toggle_mute() has any effect for this recorder as configured."""
         return False
 
     @property

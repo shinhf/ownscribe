@@ -146,6 +146,10 @@ class CoreAudioRecorder(AudioRecorder):
         return self._muted
 
     @property
+    def supports_mute(self) -> bool:
+        return self._mic
+
+    @property
     def is_recording(self) -> bool:
         return self._process is not None and self._process.poll() is None
 

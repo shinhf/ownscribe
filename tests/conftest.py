@@ -89,3 +89,5 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
             item.add_marker(pytest.mark.skip(reason="hardware tests disabled in CI"))
         if "macos" in item.keywords and sys.platform != "darwin":
             item.add_marker(pytest.mark.skip(reason="macOS-only test"))
+        if "windows" in item.keywords and sys.platform != "win32":
+            item.add_marker(pytest.mark.skip(reason="Windows-only test"))

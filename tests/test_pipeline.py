@@ -5,9 +5,14 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import signal
+import threading
 from unittest import mock
 
+import pytest
+
 from ownscribe.config import Config
+from ownscribe.keyboard import CTRL_C, CTRL_Q
 from ownscribe.transcription.models import Segment, TranscriptResult
 
 
@@ -87,6 +92,161 @@ class TestCreateRecorder:
         with mock.patch("ownscribe.audio.sounddevice_recorder.SoundDeviceRecorder") as mock_sd:
             _create_recorder(config)
             mock_sd.assert_called_once_with(device="USB Mic", silence_timeout=60)
+
+    def test_auto_backend_picks_wasapi_on_windows(self):
+        from ownscribe.pipeline import _create_recorder
+
+        config = Config()
+        config.audio.device = "Headphones"
+        config.audio.mic_device = "USB Mic"
+        config.audio.silence_timeout = 90
+
+        with (
+            mock.patch("ownscribe.config.sys.platform", "win32"),
+            mock.patch("ownscribe.audio.wasapi_recorder.WasapiLoopbackRecorder") as mock_cls,
+        ):
+            mock_cls.return_value.is_available.return_value = True
+            recorder = _create_recorder(config)
+
+        assert recorder == mock_cls.return_value
+        mock_cls.assert_called_once_with(mic=True, mic_device="USB Mic", device="Headphones", silence_timeout=90)
+
+    def test_wasapi_falls_back_to_sounddevice_when_unavailable(self, capsys):
+        from ownscribe.pipeline import _create_recorder
+
+        config = Config()
+        config.audio.backend = "wasapi"
+
+        with (
+            mock.patch("ownscribe.audio.wasapi_recorder.WasapiLoopbackRecorder") as mock_wasapi,
+            mock.patch("ownscribe.audio.sounddevice_recorder.SoundDeviceRecorder") as mock_sd,
+        ):
+            mock_wasapi.return_value.is_available.return_value = False
+            recorder = _create_recorder(config)
+
+        assert recorder == mock_sd.return_value
+        assert "falling back to sounddevice" in capsys.readouterr().out
+
+
+class TestRecordingLoopKeys:
+    """run_pipeline reads keys through key_reader only when mute is possible and stdin is a TTY."""
+
+    @staticmethod
+    def _recorder(supports_mute: bool) -> mock.MagicMock:
+        recorder = mock.MagicMock()
+        recorder.supports_mute = supports_mute
+        recorder.is_muted = False
+        recorder.silence_timed_out = False
+        recorder.silence_warning = False
+        # One loop iteration, then stop.
+        type(recorder).is_recording = mock.PropertyMock(side_effect=[True, False])
+        recorder.start.side_effect = lambda path: path.write_bytes(b"x" * 100)
+        return recorder
+
+    def _run(self, tmp_path, recorder, keys, *, tty: bool = True):
+        """Run the pipeline and return the mocked transcription step."""
+        from ownscribe.pipeline import run_pipeline
+
+        config = Config()
+        config.output.dir = str(tmp_path)
+        # The recording loop and the Ctrl+Q watcher thread share the key stream.
+        lock = threading.Lock()
+
+        def poll(_timeout):
+            with lock:
+                return next(keys, None)
+
+        @contextlib.contextmanager
+        def fake_key_reader():
+            yield poll
+
+        with (
+            mock.patch("ownscribe.pipeline._create_recorder", return_value=recorder),
+            mock.patch("ownscribe.pipeline._do_transcribe_and_summarize") as mock_ts,
+            mock.patch("ownscribe.pipeline._check_audio_silence"),
+            mock.patch("ownscribe.pipeline.key_reader", side_effect=fake_key_reader),
+            mock.patch("ownscribe.pipeline.sys.stdin") as stdin,
+            mock.patch("ownscribe.pipeline.time.sleep"),
+        ):
+            stdin.isatty.return_value = tty
+            run_pipeline(config)
+        return mock_ts
+
+    def test_m_toggles_mute(self, tmp_path):
+        recorder = self._recorder(supports_mute=True)
+        self._run(tmp_path, recorder, iter(["m"]))
+        recorder.toggle_mute.assert_called_once()
+
+    def test_m_ignored_without_mute_support(self, tmp_path):
+        recorder = self._recorder(supports_mute=False)
+        self._run(tmp_path, recorder, iter(["m"]))
+        recorder.toggle_mute.assert_not_called()
+
+    def test_ctrl_c_key_stops_and_transcribes(self, tmp_path):
+        recorder = self._recorder(supports_mute=False)
+        type(recorder).is_recording = mock.PropertyMock(return_value=True)
+        mock_ts = self._run(tmp_path, recorder, iter([CTRL_C]))
+        recorder.stop.assert_called_once()
+        mock_ts.assert_called_once()
+
+    def test_ctrl_q_stops_without_transcribing(self, tmp_path, capsys):
+        recorder = self._recorder(supports_mute=False)
+        type(recorder).is_recording = mock.PropertyMock(return_value=True)
+        mock_ts = self._run(tmp_path, recorder, iter([CTRL_Q]))
+        recorder.stop.assert_called_once()
+        mock_ts.assert_not_called()
+        assert "ownscribe transcribe" in capsys.readouterr().out
+
+    def test_sigint_after_stop_does_not_abort(self, tmp_path, capsys):
+        recorder = self._recorder(supports_mute=False)
+        # A Ctrl+C that lands while the finished recording is being saved.
+        recorder.stop.side_effect = lambda: signal.getsignal(signal.SIGINT)(signal.SIGINT, None)
+        mock_ts = self._run(tmp_path, recorder, iter([]), tty=False)
+        mock_ts.assert_called_once()
+        assert "Ctrl+Q" in capsys.readouterr().err
+
+    def test_sigint_handler_restored(self, tmp_path):
+        before = signal.getsignal(signal.SIGINT)
+        self._run(tmp_path, self._recorder(supports_mute=False), iter([]))
+        assert signal.getsignal(signal.SIGINT) is before
+
+
+class TestQuitWatcher:
+    """Ctrl+Q while a finished recording is processed exits the process."""
+
+    def test_ctrl_q_exits(self, tmp_path):
+        from ownscribe.pipeline import _watch_for_quit
+
+        @contextlib.contextmanager
+        def fake_key_reader():
+            yield lambda _timeout: CTRL_Q
+
+        with (
+            mock.patch("ownscribe.pipeline.key_reader", side_effect=fake_key_reader),
+            mock.patch("ownscribe.pipeline.os._exit") as mock_exit,
+        ):
+            _watch_for_quit(threading.Event(), tmp_path)
+        mock_exit.assert_called_once_with(130)
+
+    def test_returns_when_done(self, tmp_path):
+        from ownscribe.pipeline import _watch_for_quit
+
+        done = threading.Event()
+
+        @contextlib.contextmanager
+        def fake_key_reader():
+            def poll(_timeout):
+                done.set()
+                return "x"
+
+            yield poll
+
+        with (
+            mock.patch("ownscribe.pipeline.key_reader", side_effect=fake_key_reader),
+            mock.patch("ownscribe.pipeline.os._exit") as mock_exit,
+        ):
+            _watch_for_quit(done, tmp_path)
+        mock_exit.assert_not_called()
 
 
 class TestUnsupportedAudioSettings:
@@ -428,6 +588,28 @@ class TestDoTranscribeAndSummarize:
         assert (tmp_path / "transcript.md").exists()
         assert not (tmp_path / "summary.md").exists()
 
+    @pytest.mark.parametrize(("fmt", "ext"), [("markdown", "md"), ("json", "json")])
+    def test_non_ascii_transcript_saved_as_utf8(self, tmp_path, fmt, ext):
+        from ownscribe.pipeline import _do_transcribe_and_summarize
+
+        config = Config()
+        config.output.format = fmt
+        audio_path = tmp_path / "recording.wav"
+        audio_path.touch()
+
+        mock_transcriber = mock.MagicMock()
+        # "ń" and "Ł" are not in cp1252, the default Windows code page.
+        mock_transcriber.transcribe.return_value = TranscriptResult(
+            segments=[Segment(text="Dzień dobry, Łódź.", start=0.0, end=1.5)],
+            language="pl",
+            duration=1.5,
+        )
+
+        with mock.patch("ownscribe.pipeline._create_transcriber", return_value=mock_transcriber):
+            _do_transcribe_and_summarize(config, audio_path, tmp_path, summarize=False)
+
+        assert "Dzień dobry, Łódź." in (tmp_path / f"transcript.{ext}").read_bytes().decode("utf-8")
+
     def test_transcribe_and_summarize(self, tmp_path):
         from ownscribe.pipeline import _do_transcribe_and_summarize
 
@@ -746,6 +928,7 @@ class TestRunPipelineAudioLocation:
         recorder = mock.MagicMock()
         recorder.is_recording = False  # skip the recording loop immediately
         recorder.is_muted = False
+        recorder.supports_mute = False
         recorder.silence_timed_out = False
         recorder.silence_warning = False
 
@@ -1126,3 +1309,33 @@ class TestResume:
         with mock.patch("ownscribe.pipeline.run_summarize") as mock_sum:
             run_resume(config, str(tmp_path))
             mock_sum.assert_called_once_with(config, str(tmp_path / "transcript.json"))
+
+
+class TestCheckAudioSilence:
+    def _write(self, path, samples):
+        import numpy as np
+        import soundfile as sf
+
+        sf.write(path, np.asarray(samples, dtype="float32"), 16000, subtype="FLOAT")
+
+    def test_late_audio_is_not_silent(self, tmp_path):
+        """A recording that starts quiet (zero-padded loopback) must pass."""
+        import numpy as np
+
+        from ownscribe.pipeline import _check_audio_silence
+
+        wav = tmp_path / "late.wav"
+        self._write(wav, np.concatenate([np.zeros(16000 * 12), np.full(1600, 0.2)]))
+        _check_audio_silence(wav)  # no SystemExit
+
+    def test_all_zero_exits(self, tmp_path, capsys):
+        import numpy as np
+        import pytest
+
+        from ownscribe.pipeline import _check_audio_silence
+
+        wav = tmp_path / "silent.wav"
+        self._write(wav, np.zeros(16000 * 3))
+        with pytest.raises(SystemExit):
+            _check_audio_silence(wav)
+        assert "completely silent" in capsys.readouterr().err
