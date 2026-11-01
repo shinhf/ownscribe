@@ -227,6 +227,12 @@ class TestInvariants:
 # ---------------------------------------------------------------------------
 
 
+requires_posix_mock = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="the mock binary relies on SIGUSR1 and POSIX signal handling",
+)
+
+
 def run_mock(*args: str, fixture: Path | None = None, timeout: float = 30) -> subprocess.CompletedProcess:
     env = dict(os.environ)
     if fixture is not None:
@@ -241,6 +247,7 @@ def parse_stdout(stdout: str) -> list[dict]:
     return [json.loads(line) for line in stdout.splitlines() if line.strip()]
 
 
+@requires_posix_mock
 class TestMockBinary:
     def test_is_executable(self):
         assert MOCK.exists()
@@ -351,6 +358,7 @@ class TestMockBinary:
         assert any(e["type"] == "speakers" for e in parse_stdout(result.stdout))
 
 
+@requires_posix_mock
 class TestMockTiming:
     def test_instant_replay_is_actually_instant(self):
         """long-meeting is 71 minutes of audio; at speed 0 it must not sleep at all."""
@@ -383,6 +391,7 @@ class TestMockTiming:
         assert first_segment_at >= 0.5
 
 
+@requires_posix_mock
 class TestMockSignals:
     """SIGINT and SIGUSR1 are the two signals coreaudio.py already sends the real binary."""
 
